@@ -1,0 +1,58 @@
+name: Publish verified GreenCall installer
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+      artifact_url:
+        required: true
+        type: string
+      sha256:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Download and verify installer bundle
+        env:
+          ARTIFACT_URL: ${{ inputs.artifact_url }}
+          EXPECTED_SHA256: ${{ inputs.sha256 }}
+        run: |
+          echo "::add-mask::$ARTIFACT_URL"
+          python3 - <<'PY'
+          import os,re,urllib.request,urllib.parse,pathlib,zipfile,hashlib,base64
+          version=os.environ['VERSION']
+          assert re.fullmatch(r'\d+\.\d+\.\d+',version)
+          url=os.environ['ARTIFACT_URL']; parsed=urllib.parse.urlparse(url)
+          assert parsed.scheme=='https' and parsed.hostname.endswith('.oaiusercontent.com')
+          expected=os.environ['EXPECTED_SHA256']; assert re.fullmatch('[a-f0-9]{64}',expected)
+          target=pathlib.Path('installer.zip')
+          with urllib.request.urlopen(url,timeout=120) as source,target.open('wb') as dest:
+            while chunk:=source.read(1024*1024): dest.write(chunk)
+          assert hashlib.sha256(target.read_bytes()).hexdigest()==expected,'ZIP digest mismatch'
+          exe=f'GreenCall-Setup-{version}-x64.exe'
+          with zipfile.ZipFile(target) as z:
+            assert set(z.namelist())=={exe,exe+'.blockmap','latest.yml'}
+            assert sum(f.file_size for f in z.infolist())<512*1024*1024
+            z.extractall('release')
+          manifest=pathlib.Path('release/latest.yml').read_text()
+          assert f'version: {version}\n' in manifest and f'path: {exe}\n' in manifest
+          digest=base64.b64encode(hashlib.sha512(pathlib.Path('release',exe).read_bytes()).digest()).decode()
+          assert re.search(r'^sha512: (.+)$',manifest,re.M).group(1)==digest,'Installer digest mismatch'
+          print('Bundle and installer digests verified')
+          PY
+      - name: Upload and publish prepared draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          test "$(gh release view "v$VERSION" --json isDraft --jq .isDraft)" = true
+          gh release upload "v$VERSION" "release/GreenCall-Setup-$VERSION-x64.exe" "release/GreenCall-Setup-$VERSION-x64.exe.blockmap" release/latest.yml --clobber
+          gh release edit "v$VERSION" --draft=false --latest
